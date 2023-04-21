@@ -67,6 +67,7 @@ endif()
 option(LLAMA_ACCELERATE             "llama: enable Accelerate framework"                    ON)
 option(LLAMA_OPENBLAS               "llama: use OpenBLAS"                                   OFF)
 option(LLAMA_CUBLAS                 "llama: use cuBLAS"                                     OFF)
+option(LLAMA_ROCBLAS                "llama: use rocBLAS"                                    OFF)
 
 option(LLAMA_BUILD_TESTS            "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES         "llama: build examples" ${LLAMA_STANDALONE})
@@ -165,6 +166,29 @@ if (LLAMA_CUBLAS)
 
     else()
         message(WARNING "cuBLAS not found")
+    endif()
+endif()
+
+if (LLAMA_ROCBLAS)
+    cmake_minimum_required(VERSION 3.17)
+
+    find_package(hip)
+    find_package(rocblas)
+    if (hip_FOUND && rocblas_FOUND)
+        message(STATUS "hipBLAS found")
+
+        set(GGML_CUDA_SOURCES ggml-cuda.cu ggml-cuda.h)
+
+        add_compile_definitions(GGML_USE_HIPBLAS)
+
+        if (LLAMA_STATIC)
+            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} roc::rocblas_static hip::hipblas_static hip::amdhip64_static)
+        else()
+            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} roc::rocblas hip::hipblas hip::amdhip64)
+        endif()
+
+    else()
+        message(WARNING "hipBLAS not found")
     endif()
 endif()
 

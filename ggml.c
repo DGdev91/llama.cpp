@@ -186,6 +186,44 @@ static void init_cublas(void) {
         // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, NULL));
     }
 }
+#elif defined(GGML_USE_HIPBLAS)
+#include <hipblas/hipblas.h>
+#include <hip/hip_runtime.h>
+#include "ggml-cuda.h"
+#define HIP_CHECK(err)                                                        \
+    do {                                                                       \
+        hipError_t err_ = (err);                                              \
+        if (err_ != hipSuccess) {                                             \
+            printf("HIP error %d at %s:%d: %s\n", err_, __FILE__, __LINE__,   \
+                hipGetErrorString(err_));                                     \
+            exit(1);                                                           \
+        }                                                                      \
+    } while (0)
+
+#define HIPBLAS_CHECK(err)                                                      \
+    do {                                                                       \
+        hipblasStatus_t err_ = (err);                                           \
+        if (err_ != HIPBLAS_STATUS_SUCCESS) {                                   \
+            printf("hipBLAS error %d at %s:%d\n", err_, __FILE__, __LINE__);    \
+            exit(1);                                                           \
+        }                                                                      \
+    } while (0)
+
+static hipblasHandle_t hipblasH = NULL;
+static hipStream_t hipStream = NULL;
+static void init_hipblas(void) {
+    if (hipblasH == NULL) {
+        // create hipblas handle, bind a stream
+        HIPBLAS_CHECK(hipblasCreate(&hipblasH));
+
+        HIP_CHECK(hipStreamCreateWithFlags(&hipStream, hipStreamNonBlocking));
+
+        HIPBLAS_CHECK(hipblasSetStream(hipblasH, hipStream));
+
+        // configure logging to stdout
+        // HIPBLAS_CHECK(hipblasLoggerConfigure(1, 1, 0, NULL));
+    }
+}
 #endif
 
 #undef MIN
@@ -3721,6 +3759,9 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         // initialize cuBLAS
         #if defined(GGML_USE_CUBLAS)
         init_cublas();
+        //initialize hipBLAS
+        #elif defined(GGML_USE_HIPBLAS)
+        init_hipblas();
         #endif
 
         is_first_call = false;
@@ -7454,7 +7495,7 @@ static void ggml_compute_forward_rms_norm(
 
 // ggml_compute_forward_mul_mat
 
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
 // helper function to determine if it is better to use BLAS or not
 // for large matrices, BLAS is faster
 static bool ggml_compute_forward_mul_mat_use_blas(
@@ -7494,7 +7535,7 @@ static void ggml_compute_forward_mul_mat_f32(
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
     const int64_t ne10 = src1->ne[0];
 #endif
     const int64_t ne11 = src1->ne[1];
@@ -7551,7 +7592,7 @@ static void ggml_compute_forward_mul_mat_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
     if (ggml_compute_forward_mul_mat_use_blas(src0, src1, dst)) {
         if (params->ith != 0) {
             return;
@@ -7565,7 +7606,7 @@ static void ggml_compute_forward_mul_mat_f32(
             return;
         }
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
         float *d_X = NULL;
         float *d_Y = NULL;
         float *d_D = NULL;
@@ -7575,9 +7616,16 @@ static void ggml_compute_forward_mul_mat_f32(
         const int y_ne = ne11 * ne10;
         const int d_ne = ne11 * ne01;
 
+    #if defined(GGML_USE_CUBLAS)
         CUDA_CHECK(cudaMalloc((void **)(&d_X), sizeof(float) * x_ne));
         CUDA_CHECK(cudaMalloc((void **)(&d_Y), sizeof(float) * y_ne));
         CUDA_CHECK(cudaMalloc((void **)(&d_D), sizeof(float) * d_ne));
+    #elif defined(GGML_USE_HIPBLAS)
+        HIP_CHECK(hipMalloc((void **)(&d_X), sizeof(float) * x_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_D), sizeof(float) * d_ne));
+    #endif
+
 #endif
 
         for (int64_t i03 = 0; i03 < ne03; i03++) {
@@ -7602,6 +7650,21 @@ static void ggml_compute_forward_mul_mat_f32(
 
                 // copy data to host
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+#elif defined(GGML_USE_HIPBLAS)
+                // copy data to device
+                HIP_CHECK(hipMemcpyAsync(d_X, x, sizeof(float) * x_ne, hipMemcpyHostToDevice, hipStream));
+                HIP_CHECK(hipMemcpyAsync(d_Y, y, sizeof(float) * y_ne, hipMemcpyHostToDevice, hipStream));
+
+                // compute
+                HIPBLAS_CHECK(
+                    hipblasSgemm(hipblasH, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, ne00,
+                                    d_Y, ne10,
+                            &beta,  d_D, ne01));
+
+                // copy data to host
+                HIP_CHECK(hipMemcpyAsync(d, d_D, sizeof(float) * d_ne, hipMemcpyDeviceToHost, hipStream));
 #else
                 // zT = y * xT
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -7617,6 +7680,11 @@ static void ggml_compute_forward_mul_mat_f32(
         CUDA_CHECK(cudaFree(d_X));
         CUDA_CHECK(cudaFree(d_Y));
         CUDA_CHECK(cudaFree(d_D));
+#elif defined(GGML_USE_HIPBLAS)
+        HIP_CHECK(hipStreamSynchronize(hipStream));
+        HIP_CHECK(hipFree(d_X));
+        HIP_CHECK(hipFree(d_Y));
+        HIP_CHECK(hipFree(d_D));
 #endif
         //printf("CBLAS F32 = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 
@@ -7747,7 +7815,7 @@ static void ggml_compute_forward_mul_mat_f16_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
     if (ggml_compute_forward_mul_mat_use_blas(src0, src1, dst)) {
         GGML_ASSERT(nb10 == sizeof(float));
 
@@ -7763,7 +7831,7 @@ static void ggml_compute_forward_mul_mat_f16_f32(
             return;
         }
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
         ggml_fp16_t * const wdata = params->wdata;
 
         float *d_X = NULL;
@@ -7775,15 +7843,22 @@ static void ggml_compute_forward_mul_mat_f16_f32(
         const int y_ne = ne11 * ne10;
         const int d_ne = ne11 * ne01;
 
+	#if defined(GGML_USE_CUBLAS)
         CUDA_CHECK(cudaMalloc((void **)(&d_X), sizeof(ggml_fp16_t) * x_ne));
         CUDA_CHECK(cudaMalloc((void **)(&d_Y), sizeof(float) * y_ne));
         CUDA_CHECK(cudaMalloc((void **)(&d_D), sizeof(float) * d_ne));
+	#elif defined(GGML_USE_HIPBLAS)
+        HIP_CHECK(hipMalloc((void **)(&d_X), sizeof(ggml_fp16_t) * x_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_D), sizeof(float) * d_ne));
+	#endif
+
 #else
         float * const wdata = params->wdata;
 #endif
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
                 // with cuBlAS, instead of converting src0 to fp32, we convert src1 to fp16
                 {
                     size_t id = 0;
@@ -7826,6 +7901,28 @@ static void ggml_compute_forward_mul_mat_f16_f32(
 
                 // copy data to host
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+#elif defined(GGML_USE_HIPBLAS)
+                const ggml_fp16_t * x = (ggml_fp16_t *) ((char *) src0->data + i02*nb02 + i03*nb03);
+                const ggml_fp16_t * y = (ggml_fp16_t *) wdata;
+
+                float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
+
+                // copy data to device
+                HIP_CHECK(hipMemcpyAsync(d_X, x, sizeof(ggml_fp16_t) * x_ne, hipMemcpyHostToDevice, hipStream));
+                HIP_CHECK(hipMemcpyAsync(d_Y, y, sizeof(ggml_fp16_t) * y_ne, hipMemcpyHostToDevice, hipStream));
+
+                // compute
+                HIPBLAS_CHECK(
+                    hipblasGemmEx(hipblasH, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, HIP_R_16F, ne00,
+                                    d_Y, HIP_R_16F, ne10,
+                            &beta,  d_D, HIP_R_32F, ne01,
+                            HIPBLAS_C_32F,
+                            HIPBLAS_GEMM_DEFAULT));
+
+                // copy data to host
+                HIP_CHECK(hipMemcpyAsync(d, d_D, sizeof(float) * d_ne, hipMemcpyDeviceToHost, hipStream));
 #else
                 const float * x = wdata;
                 const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
@@ -7847,6 +7944,11 @@ static void ggml_compute_forward_mul_mat_f16_f32(
         CUDA_CHECK(cudaFree(d_X));
         CUDA_CHECK(cudaFree(d_Y));
         CUDA_CHECK(cudaFree(d_D));
+#elif defined(GGML_USE_HIPBLAS)
+        HIP_CHECK(hipStreamSynchronize(hipStream));
+        HIP_CHECK(hipFree(d_X));
+        HIP_CHECK(hipFree(d_Y));
+        HIP_CHECK(hipFree(d_D));
 #endif
         /*printf("CBLAS F16 = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);*/
 
@@ -7999,7 +8101,7 @@ static void ggml_compute_forward_mul_mat_q_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
     if (ggml_compute_forward_mul_mat_use_blas(src0, src1, dst)) {
         if (params->ith != 0) {
             return;
@@ -8042,6 +8144,35 @@ static void ggml_compute_forward_mul_mat_q_f32(
         else {
             GGML_ASSERT(false);
         }
+#elif defined(GGML_USE_HIPBLAS)
+        float *d_X = NULL;
+        float *d_Y = NULL;
+        float *d_D = NULL;
+        float *d_Q = NULL;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int x_ne = ne01 * ne10;
+        const int y_ne = ne11 * ne10;
+        const int d_ne = ne11 * ne01;
+
+        HIP_CHECK(hipMalloc((void **)(&d_X), sizeof(float) * x_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_D), sizeof(float) * d_ne));
+        HIP_CHECK(hipMalloc((void **)(&d_Q), GGML_TYPE_SIZE[type] * x_ne / GGML_BLCK_SIZE[type]));
+
+        void (*dequantize_row_q_hip)(const void * x, float * y, int k, hipStream_t stream)  = NULL;
+        if (type == GGML_TYPE_Q4_0) {
+            dequantize_row_q_hip = dequantize_row_q4_0_hip;
+        }
+        else if (type == GGML_TYPE_Q4_1) {
+            dequantize_row_q_hip = dequantize_row_q4_1_hip;
+        }
+        else if (type == GGML_TYPE_Q4_2) {
+            dequantize_row_q_hip = dequantize_row_q4_2_hip;
+        }
+        else {
+            GGML_ASSERT(false);
+        }
 #else
         float * const wdata = params->wdata;
         dequantize_row_q_t const dequantize_row_q = quantize_fns[type].dequantize_row_q;
@@ -8061,6 +8192,14 @@ static void ggml_compute_forward_mul_mat_q_f32(
 
                 dequantize_row_q_cuda(d_Q, d_X, ne01 * ne00, cudaStream);
                 CUDA_CHECK(cudaGetLastError());
+#elif defined(GGML_USE_HIPBLAS)
+                // copy and dequantize on device
+                HIP_CHECK(
+                    hipMemcpyAsync(d_Q, (char *) src0->data + i03*nb03 + i02*nb02,
+                        GGML_TYPE_SIZE[type] * x_ne / GGML_BLCK_SIZE[type], hipMemcpyHostToDevice, hipStream));
+
+                dequantize_row_q_hip(d_Q, d_X, ne01 * ne00, hipStream);
+                HIP_CHECK(hipGetLastError());
 #else
                 {
                     size_t id = 0;
@@ -8087,6 +8226,20 @@ static void ggml_compute_forward_mul_mat_q_f32(
 
                 // copy data to host
                 CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+#elif defined(GGML_USE_HIPBLAS)
+                // copy data to device
+                HIP_CHECK(hipMemcpyAsync(d_Y, y, sizeof(float) * y_ne, hipMemcpyHostToDevice, hipStream));
+
+                // compute
+                HIPBLAS_CHECK(
+                    hipblasSgemm(hipblasH, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, ne00,
+                                    d_Y, ne10,
+                            &beta,  d_D, ne01));
+
+                // copy data to host
+                HIP_CHECK(hipMemcpyAsync(d, d_D, sizeof(float) * d_ne, hipMemcpyDeviceToHost, hipStream));
 #else
                 // zT = y * xT
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -8104,6 +8257,12 @@ static void ggml_compute_forward_mul_mat_q_f32(
         CUDA_CHECK(cudaFree(d_Y));
         CUDA_CHECK(cudaFree(d_D));
         CUDA_CHECK(cudaFree(d_Q));
+#elif defined(GGML_USE_HIPBLAS)
+        HIP_CHECK(hipStreamSynchronize(hipStream));
+        HIP_CHECK(hipFree(d_X));
+        HIP_CHECK(hipFree(d_Y));
+        HIP_CHECK(hipFree(d_D));
+        HIP_CHECK(hipFree(d_Q));
 #endif
         //printf("CBLAS = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 
@@ -10921,7 +11080,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                         size_t cur = 0;
 
                         if (node->src0->type == GGML_TYPE_F16 && node->src1->type == GGML_TYPE_F32) {
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
                             if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                 node->n_tasks = 1; // TODO: this actually is doing nothing
                                                    //       the threads are still spinning
@@ -10938,7 +11097,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                         } else if (node->src0->type == GGML_TYPE_F32 && node->src1->type == GGML_TYPE_F32) {
                             cur = 0;
                         } else if (ggml_is_quantized(node->src0->type) && node->src1->type == GGML_TYPE_F32) {
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
                             if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                 node->n_tasks = 1;
                                 cur = GGML_TYPE_SIZE[GGML_TYPE_F32]*(node->src0->ne[0]*node->src0->ne[1]);
@@ -12335,7 +12494,7 @@ int ggml_cpu_has_wasm_simd(void) {
 }
 
 int ggml_cpu_has_blas(void) {
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_HIPBLAS)
     return 1;
 #else
     return 0;
@@ -12344,6 +12503,14 @@ int ggml_cpu_has_blas(void) {
 
 int ggml_cpu_has_cublas(void) {
 #if defined(GGML_USE_CUBLAS)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_hipblas(void) {
+#if defined(GGML_USE_HIPBLAS)
     return 1;
 #else
     return 0;

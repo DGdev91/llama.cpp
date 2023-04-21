@@ -1,5 +1,10 @@
 #include <stdint.h>
+#if defined(GGML_USE_HIPBLAS)
+#include "hip/hip_runtime.h"
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 #include "ggml-cuda.h"
 
 typedef uint16_t ggml_fp16_t;
@@ -132,6 +137,27 @@ static __global__ void dequantize_block_q4_3(const void * vx, float * y) {
 }
 
 extern "C" {
+#if defined(GGML_USE_HIPBLAS)
+    __host__ void dequantize_row_q4_0_hip(const void * vx, float * y, int k, hipStream_t stream) {
+        const int nb = k / QK4_0;
+        dequantize_block_q4_0<<<nb, 1, 0, stream>>>(vx, y);
+    }
+
+    __host__ void dequantize_row_q4_1_hip(const void * vx, float * y, int k, hipStream_t stream) {
+        const int nb = k / QK4_1;
+        dequantize_block_q4_1<<<nb, 1, 0, stream>>>(vx, y);
+    }
+
+    __host__ void dequantize_row_q4_2_hip(const void * vx, float * y, int k, hipStream_t stream) {
+        const int nb = k / QK4_2;
+        dequantize_block_q4_2<<<nb, 1, 0, stream>>>(vx, y);
+    }
+
+    __host__ void dequantize_row_q4_3_hip(const void * vx, float * y, int k, hipStream_t stream) {
+        const int nb = k / QK4_3;
+        dequantize_block_q4_3<<<nb, 1, 0, stream>>>(vx, y);
+    }
+#else
     __host__ void dequantize_row_q4_0_cuda(const void * vx, float * y, int k, cudaStream_t stream) {
         const int nb = k / QK4_0;
         dequantize_block_q4_0<<<nb, 1, 0, stream>>>(vx, y);
@@ -151,4 +177,5 @@ extern "C" {
         const int nb = k / QK4_3;
         dequantize_block_q4_3<<<nb, 1, 0, stream>>>(vx, y);
     }
+#endif
 }
