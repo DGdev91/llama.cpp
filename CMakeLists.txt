@@ -67,7 +67,7 @@ endif()
 option(LLAMA_ACCELERATE             "llama: enable Accelerate framework"                    ON)
 option(LLAMA_OPENBLAS               "llama: use OpenBLAS"                                   OFF)
 option(LLAMA_CUBLAS                 "llama: use cuBLAS"                                     OFF)
-option(LLAMA_ROCBLAS                "llama: use rocBLAS"                                    OFF)
+option(LLAMA_HIPBLAS                "llama: use hipBLAS"                                    OFF)
 
 option(LLAMA_BUILD_TESTS            "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES         "llama: build examples" ${LLAMA_STANDALONE})
@@ -169,27 +169,34 @@ if (LLAMA_CUBLAS)
     endif()
 endif()
 
-if (LLAMA_ROCBLAS)
-    cmake_minimum_required(VERSION 3.17)
+if (LLAMA_HIPBLAS)
+    list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+
+    if (NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang")
+        message(WARNING "Only LLVM is supported for HIP, hint: CC=/opt/rocm/llvm/bin/clang")
+    endif()
+    if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
+        message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
+    endif()
 
     find_package(hip)
-    find_package(rocblas)
-    if (hip_FOUND && rocblas_FOUND)
+    find_package(hipblas)
+
+    if (${hipblas_FOUND} AND ${hip_FOUND})
         message(STATUS "hipBLAS found")
-
-        set(GGML_CUDA_SOURCES ggml-cuda.cu ggml-cuda.h)
-
         add_compile_definitions(GGML_USE_HIPBLAS)
+        add_library(ggml-hip OBJECT ggml-cuda.cu ggml-cuda.h)
+        set_source_files_properties(ggml-cuda.cu PROPERTIES LANGUAGE CXX)
+        target_link_libraries(ggml-hip PUBLIC hip::device)
 
         if (LLAMA_STATIC)
-            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} roc::rocblas_static hip::hipblas_static hip::amdhip64_static)
-        else()
-            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} roc::rocblas hip::hipblas hip::amdhip64)
+            message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
         endif()
-
+        set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} hip::host roc::hipblas ggml-hip)
     else()
-        message(WARNING "hipBLAS not found")
+        message(WARNING "hipBLAS or HIP not found. Try setting CMAKE_PREFIX_PATH=/opt/rocm")
     endif()
+
 endif()
 
 if (LLAMA_ALL_WARNINGS)
@@ -225,6 +232,10 @@ endif()
 
 if (MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+
+    if (BUILD_SHARED_LIBS)
+        set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
 endif()
 
 if (LLAMA_LTO)
@@ -332,6 +343,7 @@ add_library(ggml OBJECT
 target_include_directories(ggml PUBLIC .)
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -344,6 +356,7 @@ add_library(llama
 target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
 target_link_libraries(llama PRIVATE ggml ${LLAMA_EXTRA_LIBS})
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_SHARED LLAMA_BUILD)

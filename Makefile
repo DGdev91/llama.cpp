@@ -101,25 +101,37 @@ ifdef LLAMA_OPENBLAS
 	LDFLAGS += -lopenblas
 endif
 ifdef LLAMA_CUBLAS
-	CFLAGS  += -DGGML_USE_CUBLAS -I/usr/local/cuda/include
-	LDFLAGS += -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L/usr/local/cuda/lib64
-	OBJS	+= ggml-cuda.o
+	CFLAGS    += -DGGML_USE_CUBLAS -I/usr/local/cuda/include
+	LDFLAGS   += -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L/usr/local/cuda/lib64
+	OBJS      += ggml-cuda.o
+	NVCC      = nvcc
+	NVCCFLAGS = --forward-unknown-to-host-linker -arch=native
 ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
-	nvcc -arch=native -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) $(CXXFLAGS) -c $< -o $@
 endif
 ifdef LLAMA_HIPBLAS
-	CFLAGS  += -DGGML_USE_HIPBLAS -D__HIP_PLATFORM_AMD__ -I/opt/rocm/include
-	LDFLAGS += -lrocblas -lhipblas -lamdhip64 -lpthread -ldl -lrt -L/opt/rocm/lib
-	OBJS	+= ggml-hip.o
-ggml-hip.o: ggml-cuda.cu ggml-cuda.h
-	/opt/rocm/hip/bin/hipcc -DGGML_USE_HIPBLAS -D__HIP_PLATFORM_AMD__ -c -o $@ $<
+	ROCM_PATH  ?= /opt/rocm
+	CC         := $(ROCM_PATH)/llvm/bin/clang
+	CXX        := $(ROCM_PATH)/llvm/bin/clang++
+	GPU_TARGETS!= $(ROCM_PATH)/llvm/bin/offload-arch
+	CFLAGS     += -DGGML_USE_HIPBLAS $(shell $(ROCM_PATH)/bin/hipconfig -C)
+	CXXFLAGS   += -DGGML_USE_HIPBLAS $(shell $(ROCM_PATH)/bin/hipconfig -C)
+	LDFLAGS    += -L/opt/rocm/lib -Wl,-rpath=$(ROCM_PATH)/lib -lhipblas -lamdhip64
+	OBJS       += ggml-cuda.o
+ggml-cuda.o: CXXFLAGS += $(addprefix --offload-arch=,$(GPU_TARGETS))
+ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
+	$(CXX) $(CXXFLAGS) -x hip -c -o $@ $<
 endif
 ifdef LLAMA_GPROF
 	CFLAGS   += -pg
 	CXXFLAGS += -pg
 endif
+ifdef LLAMA_PERF
+	CFLAGS   += -DGGML_PERF
+	CXXFLAGS += -DGGML_PERF
+endif
 ifneq ($(filter aarch64%,$(UNAME_M)),)
-	CFLAGS += -mcpu=native
+	CFLAGS   += -mcpu=native
 	CXXFLAGS += -mcpu=native
 endif
 ifneq ($(filter armv6%,$(UNAME_M)),)
